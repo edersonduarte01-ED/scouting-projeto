@@ -1,0 +1,176 @@
+import streamlit as st
+import sqlite3
+import pandas as pd
+import plotly.graph_objects as go
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
+
+# === Inicialização do Banco de Dados ===
+def init_db():
+    conn = sqlite3.connect('futebol.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS atletas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL,
+        idade INTEGER,
+        preco REAL,
+        minutagem INTEGER,
+        lesoes INTEGER,
+        risco_lesao REAL,
+        disponibilidade REAL
+    )''')
+    conn.commit()
+    conn.close()
+
+# === Função para adicionar atleta ===
+def add_atleta(nome, idade, preco, minutagem, lesoes):
+    if minutagem > 0:
+        risco_lesao = min(100.0, (lesoes / minutagem) * 10000)  # Risco baseado em lesões por 1000 minutos (ex: 1 lesão/1000min = 10%)
+    else:
+        risco_lesao = 0.0
+    disponibilidade = 100.0 - risco_lesao
+    
+    conn = sqlite3.connect('futebol.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO atletas (nome, idade, preco, minutagem, lesoes, risco_lesao, disponibilidade) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (nome, idade, preco, minutagem, lesoes, risco_lesao, disponibilidade))
+    conn.commit()
+    conn.close()
+
+# === Carrega dados dos atletas (com cache) ===
+@st.cache_data
+def load_atletas():
+    conn = sqlite3.connect('futebol.db')
+    df = pd.read_sql_query("SELECT * FROM atletas ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+# === Interface Principal ===
+st.set_page_config(page_title="Scouting Futebol", layout="wide")
+
+st.title('🧑‍💻 Sistema de Scouting de Futebol')
+
+# Inicializa o banco
+init_db()
+
+# === Formulário de Cadastro ===
+st.header('📝 Cadastro de Atletas')
+with st.form('cadastro_atleta'):
+    col1, col2 = st.columns(2)
+    with col1:
+        nome = st.text_input('Nome do Atleta', placeholder='Ex: Cristiano Ronaldo')
+        idade = st.number_input('Idade', min_value=16, max_value=45, value=25)
+    with col2:
+        preco = st.number_input('Preço (milhões €)', min_value=0.1, max_value=500.0, value=20.0, step=0.1)
+        minutagem = st.number_input('Minutagem Total', min_value=0, value=2000)
+        lesoes = st.number_input('Número de Lesões', min_value=0, value=0)
+    
+    submit = st.form_submit_button('🚀 Cadastrar Atleta', use_container_width=True)
+    if submit and nome:
+        add_atleta(nome, idade, preco, minutagem, lesoes)
+        st.cache_data.clear()
+        st.success('✅ Atleta cadastrado com sucesso!')
+        st.rerun()
+
+# === Barra Lateral: Filtros ===
+st.sidebar.header('🔍 Filtros')
+min_idade = st.sidebar.slider('Idade Mínima', 16, 45, 16)
+max_idade = st.sidebar.slider('Idade Máxima', min_idade, 45, 45)
+min_preco = st.sidebar.slider('Preço Mínimo (M€)', 0.0, 500.0, 0.0)
+max_preco = st.sidebar.slider('Preço Máximo (M€)', min_preco, 500.0, 500.0)
+
+# Carrega e filtra dados
+df = load_atletas()
+df_filtered = df[(
+    (df['idade'] >= min_idade) & (df['idade'] <= max_idade) &
+    (df['preco'] >= min_preco) & (df['preco'] <= max_preco)
+)].copy()
+
+# === Tabela de Atletas ===
+st.header('📊 Lista de Atletas')
+if not df_filtered.empty:
+    st.dataframe(df_filtered, use_container_width=True)
+else:
+    st.info('Nenhum atleta encontrado com os filtros aplicados. Cadastre alguns!')
+
+# === Gráfico de Radar ===
+st.header('📈 Comparação de Atletas (Radar)')
+nomes_filtrados = df_filtered['nome'].tolist()
+selected_nomes = st.multiselect(
+    'Selecione até 5 atletas para comparar:',
+    nomes_filtrados,
+    max_selections=5
+)
+
+if selected_nomes and 1 < len(selected_nomes) <= 5:
+    selected_df = df_filtered[df_filtered['nome'].isin(selected_nomes)].copy()
+    
+    # Cria métricas para o radar
+    selected_df['inv_preco'] = 1.0 / (selected_df['preco'] + 1e-6)
+    selected_df['juventude'] = 40.0 / selected_df['idade']
+    
+    metricas = ['disponibilidade', 'minutagem', 'inv_preco', 'juventude']
+    
+    # Normaliza 0-1
+    for col in metricas:
+        min_val = selected_df[col].min()
+        max_val = selected_df[col].max()
+        selected_df[col] = (selected_df[col] - min_val) / (max_val - min_val + 1e-6)
+    
+    fig = go.Figure()
+    for _, row in selected_df.iterrows():
+        fig.add_trace(go.Scatterpolar(
+            r=[
+                row['disponibilidade'],
+                row['minutagem'],
+                row['inv_preco'],
+                row['juventude']
+            ],
+            theta=['Disponibilidade (%)', 'Minutagem', '1/Preço', 'Juventude'],
+            fill='toself',
+            name=row['nome']
+        ))
+    
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+        showlegend=True,
+        title='Radar de Comparação (métricas normalizadas)',
+        height=600
+    )
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    if selected_nomes:
+        st.warning('Selecione pelo menos 2 e no máximo 5 atletas.')
+
+# === Sistema de Recomendação por Similaridade Cosseno ===
+st.header('🔮 Recomendações')
+if not df_filtered.empty:
+    selected_rec = st.selectbox('Atleta selecionado:', df_filtered['nome'].tolist())
+    if selected_rec:
+        features = ['idade', 'preco', 'minutagem', 'disponibilidade', 'risco_lesao']
+        feat_df = df_filtered[features].fillna(0)
+        
+        sel_row = df_filtered[df_filtered['nome'] == selected_rec].iloc[0]
+        sel_vec_raw = sel_row[features].values.reshape(1, -1)
+        all_vecs_raw = feat_df.values
+        
+        scaler = StandardScaler()
+        all_scaled = scaler.fit_transform(all_vecs_raw)
+        sel_scaled = scaler.transform(sel_vec_raw)
+        
+        sims = cosine_similarity(sel_scaled, all_scaled)[0]
+        sim_idx = np.argsort(sims)[::-1]
+        
+        recs = []
+        for i in range(1, min(6, len(sim_idx))):
+            idx = sim_idx[i]
+            nome_sim = df_filtered.iloc[idx]['nome']
+            sim_score = sims[idx]
+            recs.append({'Nome': nome_sim, 'Similaridade': f'{sim_score:.3f}'})
+        
+        rec_df = pd.DataFrame(recs)
+        st.subheader(f'Top 5 atletas semelhantes a **{selected_rec}**')
+        st.dataframe(rec_df, use_container_width=True)
+else:
+    st.info('Cadastre atletas para ver recomendações.')
